@@ -9,10 +9,20 @@
 	#include <pty.h> //openpty()
 	#include <stdbool.h> //booli
 	#include <fcntl.h>
+	#include <sys/socket.h>
+	#include <netinet/in.h>
+	#include <arpa/inet.h>
 	#define LEN 11
-	#define _GNU_SOURCE
 
+struct argStruct
+{
+	int ptyFD;
+	int eventFD;
+};
+
+void *pollFD(void *str);
 void *readFunc(void *fd);
+void *listenFunc(void *pack);
 
 int main(int argc, char** argv)
 {
@@ -20,7 +30,7 @@ int main(int argc, char** argv)
 	{
         printf("not valid amount of arguments!!\n");
 		printf("parent [max children] [pseudoterminal number] [pipe/pty]\n");
-	    exit(1);
+	    exit(EXIT_FAILURE);
 	}
 	
 	bool ptyMode;
@@ -69,7 +79,7 @@ int main(int argc, char** argv)
         if(openpty(&IPCfd[0],&IPCfd[1],ptyName,NULL,NULL))
         {
             perror("openpty");
-            exit(1);
+            exit(EXIT_FAILURE);
         }
  	    printf("pty name=%s\n",ptyName);
 		printf("master pty=%d, slave pty=%d\n",IPCfd[0],IPCfd[1]);
@@ -79,7 +89,7 @@ int main(int argc, char** argv)
 		if(pipe(IPCfd)==-1)
 		{
 			perror("pipe");
-			exit(1);
+			exit(EXIT_FAILURE);
 		}
 		
 	//	int bufferSize=fcntl(IPCfd[0],F_GETPIPE_SZ);
@@ -134,7 +144,7 @@ int main(int argc, char** argv)
 	if(pts_fd==-1)
 	{
 		perror("open pts_fd");
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 	dup2(pts_fd,STDOUT_FILENO);
 	dup2(pts_fd,STDERR_FILENO);
@@ -149,14 +159,17 @@ int main(int argc, char** argv)
 //		sleep(5);
 //    }
 
-	pthread_t thread1;
+	pthread_t thread1,thread2;
 
 
-	printf("waits for read data in %s\n",ptyMode ? "pty" : "pipe");
-	pthread_create(&thread1,NULL,readFunc,(void*) IPCfd[0]);
+	pthread_create(&thread2,NULL,listenFunc,(void*) NULL);
 
-	pthread_join(thread1,NULL);	
+	
+	//printf("waits for read data in %s\n",ptyMode ? "pty" : "pipe");
+	//pthread_create(&thread1,NULL,readFunc,(void*) IPCfd[0]);
 
+	//pthread_join(thread1,NULL);	
+	pthread_join(thread2,NULL);	
     return 0;
 }
 
@@ -172,6 +185,69 @@ void *readFunc(void *fd)
 		printf("received %d bytes:\n",len);
 		//buffer[n]='\n';
 		printf("%.*s",len,buffer);
+	}
+}
+
+void *pollFD(void *str)
+{
+
+}
+void *listenFunc(void *pack)
+{	
+	int port=0;
+	int socketFD;
+	char buffer[1024];
+	struct sockaddr_in servAddr,cliAddr;
+
+	memset(buffer,0x00,1024);
+				
+	socketFD = socket(AF_INET, SOCK_DGRAM, 0);
+	if(socketFD < 0)
+	{
+		perror("socket");
+		exit(EXIT_FAILURE);
+	}
+
+	memset(&servAddr,0x00,sizeof(servAddr));
+	memset(&cliAddr,0x00,sizeof(cliAddr));
+
+	servAddr.sin_family = AF_INET; //IPv4
+	servAddr.sin_addr.s_addr = INADDR_ANY; //all interfaces
+	servAddr.sin_port = htons(port); //system assigns port
+
+	if(bind(socketFD,(const struct sockaddr*) &servAddr, sizeof(servAddr)) <0)
+	{
+		perror("bind");
+		close(socketFD);
+		exit(EXIT_FAILURE);
+	}
+
+	socklen_t servLen=sizeof(servAddr);
+	socklen_t cliLen=sizeof(cliAddr);
+
+	if (getsockname(socketFD, (struct sockaddr*)&servAddr, &servLen) == -1) 
+	{
+        perror("getsockname");
+        close(socketFD);
+        exit(EXIT_FAILURE);
+    }
+
+	port = ntohs(servAddr.sin_port);
+
+	printf("UDP server is listening on port %d\n", port);	
+
+	int n;
+
+	while(1)
+	{
+		n = recvfrom(socketFD, (char *)buffer, 1024,  0, ( struct sockaddr *) &cliAddr, &cliLen);
+		if(n == -1)
+		{
+			perror("recvfrom");
+			close(socketFD);
+        	exit(EXIT_FAILURE);
+		}
+		printf("%.*s",n,buffer);
 	}
 
 }
