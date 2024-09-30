@@ -15,6 +15,8 @@
 	#include <poll.h>
 	#include <sys/eventfd.h>
 	#include <dirent.h>
+	#include <sys/inotify.h>
+#include <bits/pthreadtypes.h>
 	#define LEN 11
 
 struct argStruct
@@ -29,6 +31,7 @@ void *readFunc(void *fd);
 void *listenFunc(void *pack);
 
 bool redirectStdout(int pts);
+int availablePts(int ptss[], int len);
 
 int main(int argc, char** argv)
 {
@@ -78,56 +81,12 @@ int main(int argc, char** argv)
 
 	//max amount of pts's
 	int ptss[]={-1,-1,-1,-1,-1};
-	int len=sizeof(ptss) / sizeof(ptss[0]);
-
-	//check which pts's are opened
-	DIR *dirp=opendir("/dev/pts");
-	if (dirp == NULL) 
+	int len = sizeof(ptss) / sizeof(ptss[0]);
+	if(availablePts(ptss,len) != 0)
 	{
- 		perror("opendir");
- 		return 1;
- 	}
-
-	struct dirent *dir;
-
-	while((dir=readdir(dirp)) != NULL)
-	{
-		printf("%s\n", dir->d_name);
-		int num;
-		int formatRes=sscanf(dir->d_name,"%d",&num);
-		if(formatRes==1)
-		{
-			printf("number\n");
-			int biggestPts=num;
-			int biggestPtsIdx=-1;
-
-			//check if new pts is smaller than already stored
-			for (int i = 0; i < len ; i++)
-			{
-				if (ptss[i]==-1)
-				{
-					//found empty slot for new pts
-					ptss[i]=num;
-					biggestPtsIdx=-1;
-					break;
-				}
-				else 
-				if (ptss[i]>biggestPts)
-				{
-					//found bigger than current to drop
-					biggestPts = ptss[i];
-					biggestPtsIdx = i;
-				}
-			}
-
-			if (biggestPtsIdx != -1)
-			{
-				//drop biggest pts from storage
-				ptss[biggestPtsIdx]=num;
-			}
-		}
+		perror("availablePts");
+		exit(EXIT_FAILURE);
 	}
-	closedir(dirp);
 
     int IPCfd[2];
 
@@ -258,8 +217,6 @@ int main(int argc, char** argv)
 		fdArgs.ptsFD[i] = ptss[i];
 	}
 	
-	
-
 	pthread_t thread1,thread2;
 
 	pthread_create(&thread1,NULL,listenFunc,(void*) &fdArgs.eventFD);
@@ -294,7 +251,7 @@ void *pollFD(void *str)
 {
 	struct argStruct *args = str;
 	struct pollfd *pFDs;
-	nfds_t nFDs=2; //two fd pty and eventfd		
+	nfds_t nFDs=3; //pseudoterminal ,event, inotify		
 
 	char buffer[1024];
 	memset(buffer,0x00,1024);
@@ -314,6 +271,26 @@ void *pollFD(void *str)
 	pFDs[1].fd=args->eventFD;
 	pFDs[1].events = POLLIN;
 	
+	/*********INOTIFY**********/
+	/*************************/
+	int inotifyFD = inotify_init();
+	if (inotifyFD < 0) 
+	{
+        perror("inotify_init");
+        exit(EXIT_FAILURE);
+    }
+
+	// Watch the /dev/pts directory
+    int watchFD = inotify_add_watch(inotifyFD, "/dev/pts", IN_CREATE | IN_DELETE);
+	if (watchFD < 0) 
+	{
+        perror("inotify_add_watch");
+        exit(EXIT_FAILURE);
+    }
+	pFDs[2].fd=inotifyFD;
+	pFDs[2].events = POLLIN;
+
+
 	int resPoll;
 	while(1)
 	{
@@ -334,6 +311,30 @@ void *pollFD(void *str)
 			if(pFDs[i].revents & POLLIN)
 			{	
 				int len;
+				if (pFDs[i].fd == inotifyFD)
+				{
+					len = read(pFDs[i].fd,buffer,sizeof(buffer));
+
+					int j=0;
+					while (j < len) 
+					{
+            			struct inotify_event *event = (struct inotify_event *) &buffer[i];
+
+            			if (event->len) 
+						{
+                			if (event->mask & IN_CREATE) 
+							{
+                	    		printf("New pts opened: %s\n", event->name);
+                			}
+						   	else if (event->mask & IN_DELETE) 
+							{
+                	    		printf("pts closed: %s\n", event->name);
+                			}
+            			}
+            			i += (sizeof(struct inotify_event)) + event->len;
+        			}
+				}
+				else
 				// request from pseudoterminal
 				if(pFDs[i].fd == args->ptyFD)
 				{
@@ -344,12 +345,10 @@ void *pollFD(void *str)
 						{
 							if (args->ptsFD[i] == -1)
 							{
-								break;
+								continue;
 							}
 							dprintf(args->ptsFD[i],"%d received %d bytes:\n",args->ptsFD[i], len);
 							dprintf(args->ptsFD[i],"%.*s",len,buffer);
-							
-							
 						}
 						
 						// printf("received %d bytes:\n",len);
@@ -364,6 +363,7 @@ void *pollFD(void *str)
 					}
 				}
 				else
+				//request from udp server
 				if (pFDs[i].fd == args->eventFD)
 				{
 					len = read((int)pFDs[i].fd,&counter,sizeof(counter));
@@ -386,10 +386,10 @@ void *pollFD(void *str)
 					// }
 				}
 						
-				resPoll-=1;
+				resPoll--;
 				if(resPoll == 0)
 				{
-					break; //not more requests
+					break; //no more requests
 				}
 			}
 		}
@@ -486,4 +486,57 @@ bool redirectStdout(int pts)
 	close(pts_fd);
 
     return true;
+}
+
+int availablePts(int ptss[], int len)
+{
+	//check which pts's are opened
+	DIR *dirp=opendir("/dev/pts");
+	if (dirp == NULL) 
+	{
+ 		perror("opendir");
+ 		return 1;
+ 	}
+
+	struct dirent *dir;
+
+	while((dir=readdir(dirp)) != NULL)
+	{
+		printf("%s\n", dir->d_name);
+		int num;
+		int formatRes=sscanf(dir->d_name,"%d",&num);
+		if(formatRes==1)
+		{
+			printf("number\n");
+			int biggestPts=num;
+			int biggestPtsIdx=-1;
+
+			//check if new pts is smaller than already stored
+			for (int i = 0; i < len ; i++)
+			{
+				if (ptss[i]==-1)
+				{
+					//found empty slot for new pts
+					ptss[i]=num;
+					biggestPtsIdx=-1;
+					break;
+				}
+				else 
+				if (ptss[i]>biggestPts)
+				{
+					//found bigger than current to drop
+					biggestPts = ptss[i];
+					biggestPtsIdx = i;
+				}
+			}
+
+			if (biggestPtsIdx != -1)
+			{
+				//drop biggest pts from storage
+				ptss[biggestPtsIdx]=num;
+			}
+		}
+	}
+	closedir(dirp);
+	return 0;
 }
