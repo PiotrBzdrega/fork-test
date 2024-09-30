@@ -12,6 +12,8 @@
 	#include <sys/socket.h>
 	#include <netinet/in.h>
 	#include <arpa/inet.h>
+	#include <poll.h>
+	#include <sys/eventfd.h>
 	#define LEN 11
 
 struct argStruct
@@ -23,6 +25,8 @@ struct argStruct
 void *pollFD(void *str);
 void *readFunc(void *fd);
 void *listenFunc(void *pack);
+
+bool redirectStdout(int pts);
 
 int main(int argc, char** argv)
 {
@@ -58,10 +62,10 @@ int main(int argc, char** argv)
 	int target_pty;
 	sscanf(argv[2],"%d",&target_pty);
 
-	char pty_path[20];
-	snprintf(pty_path,20,"/dev/pts/%d",target_pty);
+	// char pty_path[20];
+	// snprintf(pty_path,20,"/dev/pts/%d",target_pty);
 
-	printf("target pty=%s\n",pty_path);
+	// printf("target pty=%s\n",pty_path);
 
 	char numb[LEN];
 	char *args[]={absolute_path_child,NULL,NULL};
@@ -140,15 +144,21 @@ int main(int argc, char** argv)
 	//close write pipe end
 	close(IPCfd[1]);
 
-	int pts_fd=open(pty_path,O_WRONLY);
-	if(pts_fd==-1)
+	if(!redirectStdout(target_pty))
 	{
-		perror("open pts_fd");
+		perror("redirectStdout");
 		exit(EXIT_FAILURE);
 	}
-	dup2(pts_fd,STDOUT_FILENO);
-	dup2(pts_fd,STDERR_FILENO);
-	close(pts_fd);
+
+	// int pts_fd=open(pty_path,O_WRONLY);
+	// if(pts_fd==-1)
+	// {
+	// 	perror("open pts_fd");
+	// 	exit(EXIT_FAILURE);
+	// }
+	// dup2(pts_fd,STDOUT_FILENO);
+	// dup2(pts_fd,STDERR_FILENO);
+	// close(pts_fd);
 
 
 //    int counter=0;
@@ -159,17 +169,22 @@ int main(int argc, char** argv)
 //		sleep(5);
 //    }
 
+	struct argStruct fdArgs;
+	fdArgs.ptyFD = IPCfd[0];
+	fdArgs.eventFD = eventfd(0,0);
+
 	pthread_t thread1,thread2;
 
+	pthread_create(&thread1,NULL,listenFunc,(void*) &fdArgs.eventFD);
 
-	pthread_create(&thread2,NULL,listenFunc,(void*) NULL);
-
+	pthread_create(&thread2,NULL,pollFD,(void*) &fdArgs);
 	
 	//printf("waits for read data in %s\n",ptyMode ? "pty" : "pipe");
 	//pthread_create(&thread1,NULL,readFunc,(void*) IPCfd[0]);
 
 	//pthread_join(thread1,NULL);	
-	pthread_join(thread2,NULL);	
+	pthread_join(thread1,NULL);
+	pthread_join(thread2,NULL);
     return 0;
 }
 
@@ -181,7 +196,7 @@ void *readFunc(void *fd)
 	int len;
 	while(1)
 	{
-		len=read((int)fd,buffer,1023);
+		len=read((int)fd,buffer,sizeof(buffer));
 		printf("received %d bytes:\n",len);
 		//buffer[n]='\n';
 		printf("%.*s",len,buffer);
@@ -190,9 +205,97 @@ void *readFunc(void *fd)
 
 void *pollFD(void *str)
 {
+	struct argStruct *args = str;
+	struct pollfd *pFDs;
+	nfds_t nFDs=2; //two fd pty and eventfd		
 
+	char buffer[1024];
+	memset(buffer,0x00,1024);
+
+	uint64_t counter = 0;
+
+	pFDs = calloc(nFDs,sizeof(struct pollfd));
+	
+	/*********PTYFD************/
+	/*************************/
+	pFDs[0].fd=args->ptyFD;
+	pFDs[0].events = POLLIN;
+	
+
+	/*********EVENTFD**********/
+	/*************************/
+	pFDs[1].fd=args->eventFD;
+	pFDs[1].events = POLLIN;
+	
+	int resPoll;
+	while(1)
+	{
+		resPoll=poll(pFDs,nFDs,-1);
+		if(resPoll == -1)
+		{
+			perror("poll");
+			exit(EXIT_FAILURE);
+		}
+		
+		for(nfds_t i = 0; i < nFDs; i++)
+		{
+			printf("  fd=%d; events: %s%s%s\n", pFDs[i].fd,
+   			(pFDs[i].revents & POLLIN)  ? "POLLIN "  : "",
+            (pFDs[i].revents & POLLHUP) ? "POLLHUP " : "",
+            (pFDs[i].revents & POLLERR) ? "POLLERR " : "");
+
+			if(pFDs[i].revents & POLLIN)
+			{	
+				int len;
+				// request from pseudoterminal
+				if(pFDs[i].fd == args->ptyFD)
+				{
+					if (counter < 11)
+					{
+						len = read((int)pFDs[i].fd,buffer,sizeof(buffer));
+						printf("received %d bytes:\n",len);
+						printf("%.*s",len,buffer);
+					}
+					else
+					{
+						//discard data received but not read
+						if(tcflush(pFDs[i].fd,TCIFLUSH)==0)
+							printf("buffer flushed\n");
+					}
+				}
+				else
+				if (pFDs[i].fd == args->eventFD)
+				{
+					len = read((int)pFDs[i].fd,&counter,sizeof(counter));
+					printf("received %d bytes:\n",len);
+					printf("%llu\n",(unsigned long long)counter);
+					
+					redirectStdout(counter>10 ? -1 : (int)counter);
+
+					// if(counter >10)
+					// {
+					// 	pFDs[0].events=0;
+					// }
+					// else
+					// {
+					// 	if(pFDs[0].events ==0)
+					// 	{
+					// 		printf("restore to pollin\n");
+					// 		pFDs[0].events = POLLIN;
+					// 	}
+					// }
+				}
+						
+				resPoll-=1;
+				if(resPoll == 0)
+				{
+					break; //not more requests
+				}
+			}
+		}
+	}
 }
-void *listenFunc(void *pack)
+void *listenFunc(void *eventfd)
 {	
 	int port=0;
 	int socketFD;
@@ -240,7 +343,7 @@ void *listenFunc(void *pack)
 
 	while(1)
 	{
-		n = recvfrom(socketFD, (char *)buffer, 1024,  0, ( struct sockaddr *) &cliAddr, &cliLen);
+		n = recvfrom(socketFD, (char *)buffer, sizeof(buffer),  0, ( struct sockaddr *) &cliAddr, &cliLen);
 		if(n == -1)
 		{
 			perror("recvfrom");
@@ -248,7 +351,38 @@ void *listenFunc(void *pack)
         	exit(EXIT_FAILURE);
 		}
 		printf("%.*s",n,buffer);
-	}
 
+		int fd = *(int*)eventfd;
+
+		uint64_t value_to_write = atoi(buffer);
+		int res=write(fd,&value_to_write,sizeof(value_to_write));
+
+		printf("write to fd %d with result %d\n",fd,res);
+	}
 }
 
+bool redirectStdout(int pts)
+{
+	printf("current tty STDOUT %s ",ttyname(STDOUT_FILENO));
+
+	char pty_path[20];
+
+	const char *format;
+	format=(pts ==-1) ? "/dev/null" : "/dev/pts/%d";
+
+	snprintf(pty_path,20,format,pts);
+	
+	printf("Try to open=%s\n",pty_path);
+
+	int pts_fd=open(pty_path,O_WRONLY);
+	if(pts_fd==-1)
+	{
+		perror(pty_path);
+		return false;
+	}
+	dup2(pts_fd,STDOUT_FILENO);
+	dup2(pts_fd,STDERR_FILENO);
+	close(pts_fd);
+
+    return true;
+}
