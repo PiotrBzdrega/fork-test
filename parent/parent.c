@@ -14,12 +14,14 @@
 	#include <arpa/inet.h>
 	#include <poll.h>
 	#include <sys/eventfd.h>
+	#include <dirent.h>
 	#define LEN 11
 
 struct argStruct
 {
 	int ptyFD;
 	int eventFD;
+	int ptsFD[5];
 };
 
 void *pollFD(void *str);
@@ -74,6 +76,58 @@ int main(int argc, char** argv)
 	dup2(null_fd,STDIN_FILENO);
 	close(null_fd);
 
+	//max amount of pts's
+	int ptss[]={-1,-1,-1,-1,-1};
+	int len=sizeof(ptss) / sizeof(ptss[0]);
+
+	//check which pts's are opened
+	DIR *dirp=opendir("/dev/pts");
+	if (dirp == NULL) 
+	{
+ 		perror("opendir");
+ 		return 1;
+ 	}
+
+	struct dirent *dir;
+
+	while((dir=readdir(dirp)) != NULL)
+	{
+		printf("%s\n", dir->d_name);
+		int num;
+		int formatRes=sscanf(dir->d_name,"%d",&num);
+		if(formatRes==1)
+		{
+			printf("number\n");
+			int biggestPts=num;
+			int biggestPtsIdx=-1;
+
+			//check if new pts is smaller than already stored
+			for (int i = 0; i < len ; i++)
+			{
+				if (ptss[i]==-1)
+				{
+					//found empty slot for new pts
+					ptss[i]=num;
+					biggestPtsIdx=-1;
+					break;
+				}
+				else 
+				if (ptss[i]>biggestPts)
+				{
+					//found bigger than current to drop
+					biggestPts = ptss[i];
+					biggestPtsIdx = i;
+				}
+			}
+
+			if (biggestPtsIdx != -1)
+			{
+				//drop biggest pts from storage
+				ptss[biggestPtsIdx]=num;
+			}
+		}
+	}
+	closedir(dirp);
 
     int IPCfd[2];
 
@@ -87,6 +141,15 @@ int main(int argc, char** argv)
         }
  	    printf("pty name=%s\n",ptyName);
 		printf("master pty=%d, slave pty=%d\n",IPCfd[0],IPCfd[1]);
+
+		if (target_pty == -1)
+		{
+			char r[10];
+			// extract number from /dev/pts/8
+    		int ret=sscanf(ptyName, "%9[/devpts] %d", r, &target_pty);
+    		printf("prefix=%s \t pts=%d\n",r,target_pty);
+		}
+		
 	}
 	else
 	{
@@ -103,7 +166,6 @@ int main(int argc, char** argv)
 	//	}
 
 		printf("read pipe end=%d, write pipe end=%d\n",IPCfd[0],IPCfd[1]);
-
 	}
 	
 	printf("parent pid=%d\n",getpid());
@@ -139,11 +201,29 @@ int main(int argc, char** argv)
 		}	
 	}
 
-	
+	for (size_t i = 0; i < len; i++)
+	{
+		printf("%d\n",ptss[i]);
+		if (ptss[i] != -1)
+		{
+			char pty_path[20];
+			snprintf(pty_path,20,"/dev/pts/%d",ptss[i]);
+
+			ptss[i]=open(pty_path,O_WRONLY | O_NONBLOCK);
+			if(ptss[i]==-1)
+			{		
+				perror(pty_path);
+				return false;
+			}
+		}
+	}	
+
 	//close slave side of pty
 	//close write pipe end
 	close(IPCfd[1]);
 
+
+	// target_pty=-1;
 	if(!redirectStdout(target_pty))
 	{
 		perror("redirectStdout");
@@ -172,6 +252,13 @@ int main(int argc, char** argv)
 	struct argStruct fdArgs;
 	fdArgs.ptyFD = IPCfd[0];
 	fdArgs.eventFD = eventfd(0,0);
+	//array of all opened ptss
+	for (size_t i = 0; i < len; i++)
+	{	
+		fdArgs.ptsFD[i] = ptss[i];
+	}
+	
+	
 
 	pthread_t thread1,thread2;
 
@@ -239,10 +326,10 @@ void *pollFD(void *str)
 		
 		for(nfds_t i = 0; i < nFDs; i++)
 		{
-			printf("  fd=%d; events: %s%s%s\n", pFDs[i].fd,
-   			(pFDs[i].revents & POLLIN)  ? "POLLIN "  : "",
-            (pFDs[i].revents & POLLHUP) ? "POLLHUP " : "",
-            (pFDs[i].revents & POLLERR) ? "POLLERR " : "");
+			// printf("  fd=%d; events: %s%s%s\n", pFDs[i].fd,
+   			// (pFDs[i].revents & POLLIN)  ? "POLLIN "  : "",
+            // (pFDs[i].revents & POLLHUP) ? "POLLHUP " : "",
+            // (pFDs[i].revents & POLLERR) ? "POLLERR " : "");
 
 			if(pFDs[i].revents & POLLIN)
 			{	
@@ -253,14 +340,27 @@ void *pollFD(void *str)
 					if (counter < 11)
 					{
 						len = read((int)pFDs[i].fd,buffer,sizeof(buffer));
-						printf("received %d bytes:\n",len);
-						printf("%.*s",len,buffer);
+						for (size_t i = 0; i < 5; i++)
+						{
+							if (args->ptsFD[i] == -1)
+							{
+								break;
+							}
+							dprintf(args->ptsFD[i],"%d received %d bytes:\n",args->ptsFD[i], len);
+							dprintf(args->ptsFD[i],"%.*s",len,buffer);
+							
+							
+						}
+						
+						// printf("received %d bytes:\n",len);
+						// printf("%.*s",len,buffer);
 					}
 					else
 					{
 						//discard data received but not read
 						if(tcflush(pFDs[i].fd,TCIFLUSH)==0)
-							printf("buffer flushed\n");
+						;
+							// printf("buffer flushed\n");
 					}
 				}
 				else
@@ -295,6 +395,7 @@ void *pollFD(void *str)
 		}
 	}
 }
+
 void *listenFunc(void *eventfd)
 {	
 	int port=0;
