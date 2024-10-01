@@ -16,28 +16,50 @@
 	#include <sys/eventfd.h>
 	#include <dirent.h>
 	#include <sys/inotify.h>
-#include <bits/pthreadtypes.h>
+	#include <bits/pthreadtypes.h>
+	#include <linux/limits.h>
+	#include <sys/timerfd.h>
+	// #include <linux/time.h>
+	// #include <linux/time.h>
 	#define LEN 11
+
+struct ptyStruct
+{
+	int pty;
+	int fd;
+};
 
 struct argStruct
 {
 	int ptyFD;
 	int eventFD;
-	int ptsFD[5];
+	struct ptyStruct ptsFD[5];
+	int timerFD;
 };
+
+
 
 void *pollFD(void *str);
 void *readFunc(void *fd);
 void *listenFunc(void *pack);
 
 bool redirectStdout(int pts);
-int availablePts(int ptss[], int len);
+
+int availablePts(struct ptyStruct ptss[5], int len);
+void appendPts(struct ptyStruct ptss[5], int len, int num, bool init);
+bool removePts(struct ptyStruct ptss[5], int len, int pty);
+void findNotAssignedPts(struct ptyStruct ptss[5], int len);
 
 int main(int argc, char** argv)
 {
 	if(argc!=4)
 	{
         printf("not valid amount of arguments!!\n");
+		for (size_t i = 0; i < argc; i++)
+		{
+			printf("%s\n",argv[argc]);
+		}
+		
 		printf("parent [max children] [pseudoterminal number] [pipe/pty]\n");
 	    exit(EXIT_FAILURE);
 	}
@@ -80,14 +102,21 @@ int main(int argc, char** argv)
 	close(null_fd);
 
 	//max amount of pts's
-	int ptss[]={-1,-1,-1,-1,-1};
-	int len = sizeof(ptss) / sizeof(ptss[0]);
-	if(availablePts(ptss,len) != 0)
+	int ptssLen = 5;
+	struct ptyStruct ptss[5];
+	for (size_t i = 0; i < ptssLen; i++)
+	{
+		ptss[i].pty = -1;
+		ptss[i].fd = -1;
+	}
+	
+	if(availablePts(ptss,ptssLen) != 0)
 	{
 		perror("availablePts");
 		exit(EXIT_FAILURE);
 	}
 
+	//create pipe or pseudoterminal
     int IPCfd[2];
 
 	if(ptyMode)
@@ -160,16 +189,16 @@ int main(int argc, char** argv)
 		}	
 	}
 
-	for (size_t i = 0; i < len; i++)
+	for (size_t i = 0; i < ptssLen; i++)
 	{
-		printf("%d\n",ptss[i]);
-		if (ptss[i] != -1)
+		printf("%d\n",ptss[i].pty);
+		if (ptss[i].pty != -1)
 		{
 			char pty_path[20];
-			snprintf(pty_path,20,"/dev/pts/%d",ptss[i]);
+			snprintf(pty_path,20,"/dev/pts/%d",ptss[i].pty);
 
-			ptss[i]=open(pty_path,O_WRONLY | O_NONBLOCK);
-			if(ptss[i]==-1)
+			ptss[i].fd=open(pty_path,O_WRONLY | O_NONBLOCK);
+			if(ptss[i].fd==-1)
 			{		
 				perror(pty_path);
 				return false;
@@ -212,7 +241,7 @@ int main(int argc, char** argv)
 	fdArgs.ptyFD = IPCfd[0];
 	fdArgs.eventFD = eventfd(0,0);
 	//array of all opened ptss
-	for (size_t i = 0; i < len; i++)
+	for (size_t i = 0; i < ptssLen; i++)
 	{	
 		fdArgs.ptsFD[i] = ptss[i];
 	}
@@ -251,7 +280,7 @@ void *pollFD(void *str)
 {
 	struct argStruct *args = str;
 	struct pollfd *pFDs;
-	nfds_t nFDs=3; //pseudoterminal ,event, inotify		
+	nfds_t nFDs=4; //pseudoterminal ,event, inotify, timer
 
 	char buffer[1024];
 	memset(buffer,0x00,1024);
@@ -290,6 +319,11 @@ void *pollFD(void *str)
 	pFDs[2].fd=inotifyFD;
 	pFDs[2].events = POLLIN;
 
+	/**********TIMERFD*********/
+	/*************************/
+	//deactivated by default
+	pFDs[3].fd = -1;
+	pFDs[3].events = 0;
 
 	int resPoll;
 	while(1)
@@ -318,20 +352,33 @@ void *pollFD(void *str)
 					int j=0;
 					while (j < len) 
 					{
-            			struct inotify_event *event = (struct inotify_event *) &buffer[i];
+            			struct inotify_event *event = (struct inotify_event *) &buffer[j];
 
             			if (event->len) 
 						{
                 			if (event->mask & IN_CREATE) 
 							{
                 	    		printf("New pts opened: %s\n", event->name);
+								int num;
+								if(sscanf(event->name,"%d",&num)==1)
+								{
+									appendPts(args->ptsFD,5,num,false);
+								}
                 			}
 						   	else if (event->mask & IN_DELETE) 
 							{
                 	    		printf("pts closed: %s\n", event->name);
+								int num;
+								if(sscanf(event->name,"%d",&num)==1)
+								{
+									if(removePts(args->ptsFD,5,num))
+									{
+										findNotAssignedPts(args->ptsFD, 5);
+									}
+								}
                 			}
             			}
-            			i += (sizeof(struct inotify_event)) + event->len;
+            			j += (sizeof(struct inotify_event)) + event->len;
         			}
 				}
 				else
@@ -343,12 +390,12 @@ void *pollFD(void *str)
 						len = read((int)pFDs[i].fd,buffer,sizeof(buffer));
 						for (size_t i = 0; i < 5; i++)
 						{
-							if (args->ptsFD[i] == -1)
+							if (args->ptsFD[i].pty == -1)
 							{
 								continue;
 							}
-							dprintf(args->ptsFD[i],"%d received %d bytes:\n",args->ptsFD[i], len);
-							dprintf(args->ptsFD[i],"%.*s",len,buffer);
+							dprintf(args->ptsFD[i].fd,"%d received %d bytes:\n",args->ptsFD[i].pty, len);
+							dprintf(args->ptsFD[i].fd,"%.*s",len,buffer);
 						}
 						
 						// printf("received %d bytes:\n",len);
@@ -369,8 +416,37 @@ void *pollFD(void *str)
 					len = read((int)pFDs[i].fd,&counter,sizeof(counter));
 					printf("received %d bytes:\n",len);
 					printf("%llu\n",(unsigned long long)counter);
+
+					if(counter < 11)
+					{
+						//check if timer is already activated
+						if (pFDs[3].fd=-1)
+						{	
+							//TODO: not sure if NONBLOCK timer is needed 
+							pFDs[3].fd=timerfd_create( CLOCK_REALTIME, TFD_NONBLOCK);
+							if(pFDs[3].fd ==-1)
+							{
+								perror("timerfd_create");
+								exit(EXIT_FAILURE);
+							}
+							struct itimerspec newValue;
+							newValue.it_value.tv_nsec = 0;
+							newValue.it_value.tv_sec = 120;
+
+							// w/o interval
+							newValue.it_interval.tv_sec = 0;
+							newValue.it_interval.tv_nsec = 0;
+							if(timerfd_settime(pFDs[3].fd, 0, &newValue, NULL) == -1)
+							{
+								perror("timerfd_settime");
+								exit(EXIT_FAILURE);								
+							}
+							pFDs[3].events=POLLIN;
+						}
+						
+					}
 					
-					redirectStdout(counter>10 ? -1 : (int)counter);
+					// redirectStdout(counter>10 ? -1 : (int)counter);
 
 					// if(counter >10)
 					// {
@@ -385,6 +461,22 @@ void *pollFD(void *str)
 					// 	}
 					// }
 				}
+				//timer
+				if (i==3)
+				{
+					uint64_t numExp;
+					len = read(pFDs[i].fd, &numExp, sizeof(uint64_t));
+					if (len != sizeof(uint64_t))
+					{
+						perror("read timerfd");
+					}
+					printf("expiration %ld\n",numExp);
+					counter=11;
+
+ 					close(pFDs[i].fd);
+					pFDs[i].fd = -1;
+				}
+				
 						
 				resPoll--;
 				if(resPoll == 0)
@@ -488,7 +580,7 @@ bool redirectStdout(int pts)
     return true;
 }
 
-int availablePts(int ptss[], int len)
+int availablePts(struct ptyStruct ptss[5], int len)
 {
 	//check which pts's are opened
 	DIR *dirp=opendir("/dev/pts");
@@ -508,35 +600,206 @@ int availablePts(int ptss[], int len)
 		if(formatRes==1)
 		{
 			printf("number\n");
-			int biggestPts=num;
-			int biggestPtsIdx=-1;
-
-			//check if new pts is smaller than already stored
-			for (int i = 0; i < len ; i++)
-			{
-				if (ptss[i]==-1)
-				{
-					//found empty slot for new pts
-					ptss[i]=num;
-					biggestPtsIdx=-1;
-					break;
-				}
-				else 
-				if (ptss[i]>biggestPts)
-				{
-					//found bigger than current to drop
-					biggestPts = ptss[i];
-					biggestPtsIdx = i;
-				}
-			}
-
-			if (biggestPtsIdx != -1)
-			{
-				//drop biggest pts from storage
-				ptss[biggestPtsIdx]=num;
-			}
+			appendPts(ptss,len,num,true);
 		}
 	}
 	closedir(dirp);
 	return 0;
+}
+
+void appendPts(struct ptyStruct ptss[5], int len,int num, bool init)
+{
+	int biggestPts=num;
+	int biggestPtsIdx=-1;
+	//check if new pts is smaller than already stored
+	for (int i = 0; i < len ; i++)
+	{
+		if (ptss[i].pty==-1)
+		{
+			//found empty slot for new pts
+			ptss[i].pty=num;
+			biggestPtsIdx=-1;
+
+			if (!init)
+			{
+				char pty_path[20];
+				snprintf(pty_path,20,"/dev/pts/%d",ptss[i].pty);
+
+				ptss[i].fd=open(pty_path,O_WRONLY | O_NONBLOCK);
+				if(ptss[i].fd==-1)
+				{		
+					perror(pty_path);
+					ptss[i].pty=-1;
+					return;
+				}
+				printf("opened pty:%d file descriptor %d\n",ptss[i].pty,ptss[i].fd);
+			}
+			break;
+		}
+		else 
+		if (ptss[i].pty>biggestPts && init)
+		{
+			//found bigger than current to drop
+			biggestPts = ptss[i].pty;
+			biggestPtsIdx = i;
+		}
+	}
+
+	if (biggestPtsIdx != -1)
+	{
+		//drop biggest pts from storage
+		ptss[biggestPtsIdx].pty=num;
+	}
+}
+
+bool removePts(struct ptyStruct ptss[5], int len, int pty)
+{
+	for (int i = 0; i < len ; i++)
+	{
+		if (ptss[i].pty==pty)
+		{
+			//found occupied slot by given pty
+			ptss[i].pty=-1;
+			close(ptss[i].fd);
+			printf("closed pty: %d file descriptor %d\n",pty,ptss[i].fd);
+			ptss[i].fd = -1;
+			return true;
+		}
+	}
+	return false;
+}
+
+void findNotAssignedPts(struct ptyStruct ptss[5], int len)
+{
+	char buf[NAME_MAX];
+	//check current STDOUT pts to not take it into account
+	int bytes=readlink("/proc/self/fd/1",buf,NAME_MAX);
+	if (bytes == -1) 
+	{
+       perror("readlink");
+       exit(EXIT_FAILURE);
+    }
+	buf[bytes]='\n';
+	printf("STDOUT link=%s\n",buf);
+
+	int stdoutPty;
+	char prefix[9];
+	int ret=sscanf(buf, "%9[/devpts] %d", prefix, &stdoutPty);
+    printf("prefix=%s \t pts=%d\n",prefix,stdoutPty);
+
+	//check which pts's are opened
+	DIR *dirp=opendir("/dev/pts");
+	if (dirp == NULL) 
+	{
+ 		perror("opendir");
+ 		return ;
+ 	}
+
+	//Pts available in /dev/pts/...
+	const int maxPts=10;
+	int availablePts[maxPts];
+	memset(availablePts,-1,maxPts);
+	struct dirent *dir;
+
+	int foundPts=0;
+	while((dir=readdir(dirp)) != NULL)
+	{
+		printf("%s\n", dir->d_name);
+		int num;
+		int formatRes=sscanf(dir->d_name,"%d",&num);
+		if(formatRes==1 )
+		{
+			printf("number %d\n",num);
+
+			bool alreadyExists=false;
+			//check if given pts is already in ptts storage
+			for (size_t i = 0; i < len; i++)
+			{
+				if (ptss[i].pty==num || stdoutPty==num)
+				{
+					alreadyExists=true;
+					break;
+				}
+			}
+
+			if (alreadyExists)
+			{
+				continue;
+				printf("already exists\n");
+			}
+
+			availablePts[foundPts]=num;
+			foundPts++;
+			if (foundPts>=maxPts)
+			{
+				break;
+			}
+		}
+	}
+	closedir(dirp);
+
+	if (foundPts==0)
+	{
+		printf("not found any new PTS\n");
+		return;
+	}
+
+	printf("all founded pts:\n");
+	for (size_t i = 0; i < foundPts; i++)
+	{
+		printf("%d\t",availablePts[i]);
+	}
+	printf("\n");
+
+	//sort founded Pts
+	for (size_t i = 0; i < foundPts-1; i++)
+	{
+		for (size_t j = i+1; j < foundPts; j++)
+		{
+			if (availablePts[i] < availablePts[j])
+			{
+				printf("change: %d is smaller than %d\n",availablePts[i], availablePts[j]);
+				int tmp=availablePts[i];
+				availablePts[i]=availablePts[j];
+				availablePts[j]=tmp;
+			}
+		}
+	}
+
+	printf("all founded sorted pts:\n");
+	for (size_t i = 0; i < foundPts; i++)
+	{
+		printf("%d\t",availablePts[i]);
+	}
+	printf("\n");
+
+	for (size_t i = 0; i < len; i++)
+	{
+		if (ptss[i].pty==-1 )
+		{	
+			printf("foundPts: %d\n",foundPts);
+			foundPts--;
+			ptss[i].pty=availablePts[foundPts];
+
+			char pty_path[20];
+			printf("New pty %d will be opening\n",ptss[i].pty);
+			snprintf(pty_path,20,"/dev/pts/%d",ptss[i].pty);
+			ptss[i].fd=open(pty_path,O_WRONLY | O_NONBLOCK);
+			if(ptss[i].fd==-1)
+			{		
+				perror(pty_path);
+				ptss[i].pty=-1;
+				i--;
+				continue;
+			}
+			printf("opened pty:%d file descriptor %d\n",ptss[i].pty,ptss[i].fd);
+
+			if (foundPts<=0)
+			{
+				break;
+			}
+		}
+	}
+	
+
 }
